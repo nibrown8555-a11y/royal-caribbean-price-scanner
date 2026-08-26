@@ -26,6 +26,16 @@ const BOOKED_URL = process.env.CRUISE_PLANNER_URL || 'https://www.royalcaribbean
 if (!DATABASE_URL) throw new Error('DATABASE_URL is required');
 const pool = new Pool({ connectionString: DATABASE_URL, ssl: false });
 
+function sessionStateSummary() {
+  if (!ROYAL_STORAGE_STATE_JSON) return { configured:false, cookieCount:0, originCount:0, validJson:true };
+  try {
+    const state = JSON.parse(ROYAL_STORAGE_STATE_JSON);
+    return { configured:true, cookieCount:Array.isArray(state?.cookies)?state.cookies.length:0, originCount:Array.isArray(state?.origins)?state.origins.length:0, validJson:true };
+  } catch {
+    return { configured:true, cookieCount:0, originCount:0, validJson:false };
+  }
+}
+
 function logScan(result) {
   console.log('SCAN_RESULT ' + JSON.stringify({
     ok: !!result?.ok, status: result?.status || 'unknown', price: result?.price ?? null,
@@ -123,24 +133,33 @@ async function makeContext(browser) {
   return context;
 }
 
+async function looksAuthenticated(page) {
+  const text=(await page.locator('body').innerText().catch(()=>'' )).slice(0,50000).toLowerCase();
+  return text.includes('manage reservation') || text.includes('sign out') || text.includes('my cruises') || text.includes('cruise planner');
+}
+
 async function ensureLoggedIn(page) {
   await page.goto(BOOKED_URL,{waitUntil:'networkidle',timeout:90000}).catch(()=>{});
   await page.waitForTimeout(4000);
   let text=(await page.locator('body').innerText().catch(()=>'' )).slice(0,50000);
   let lower=text.toLowerCase();
-  if(lower.includes('manage reservation')||lower.includes('sign out')||lower.includes('my cruises')) return {ok:true};
+  if(await looksAuthenticated(page)) return {ok:true,via:ROYAL_STORAGE_STATE_JSON?'captured_session':'existing_session'};
+
+  if(ROYAL_STORAGE_STATE_JSON) {
+    await diagnostics(page,'SESSION_REJECTED');
+    return {ok:false,reason:'captured_session_rejected',text};
+  }
 
   if(!ROYAL_EMAIL||!ROYAL_PASSWORD) return {ok:false,reason:'credentials_missing',text};
   await page.goto(LOGIN_URL,{waitUntil:'networkidle',timeout:90000}).catch(()=>{});
   await page.waitForTimeout(7000);
 
-  // Accept cookie banners that can block hydration/interactions.
   await clickInFrames(page,['button:has-text("Accept All")','button:has-text("Accept all")','button:has-text("Allow All")','button:has-text("Agree")']).catch(()=>{});
   await page.waitForTimeout(1500);
 
   text=(await page.locator('body').innerText().catch(()=>'' )).slice(0,50000);
   lower=text.toLowerCase();
-  if(lower.includes('manage reservation')||lower.includes('sign out')||lower.includes('my cruises')) return {ok:true};
+  if(await looksAuthenticated(page)) return {ok:true,via:'credential_login'};
 
   const emailOk=await fillInFrames(page,[
     'input[type="email"]','input[autocomplete="email"]','input[autocomplete="username"]','input[name*="email" i]',
@@ -163,10 +182,8 @@ async function ensureLoggedIn(page) {
 
   await page.goto(BOOKED_URL,{waitUntil:'networkidle',timeout:90000}).catch(()=>{});
   await page.waitForTimeout(5000);
-  text=(await page.locator('body').innerText().catch(()=>'' )).slice(0,50000);
-  lower=text.toLowerCase();
-  if(lower.includes('sign in')&&!lower.includes('manage reservation')){await diagnostics(page,'POSTLOGIN');return {ok:false,reason:'post_login_check_failed',text};}
-  return {ok:true};
+  if(!(await looksAuthenticated(page))){await diagnostics(page,'POSTLOGIN');return {ok:false,reason:'post_login_check_failed',text};}
+  return {ok:true,via:'credential_login'};
 }
 
 async function scanOnce() {
@@ -185,10 +202,11 @@ async function scanOnce() {
       const txt=auth.text||(await page.locator('body').innerText().catch(()=>''));
       await pool.query(`insert into scans(ship,sail_date,package_name,page_url,status,raw_text) values($1,$2,$3,$4,$5,$6)`,[CRUISE_SHIP,SAIL_DATE,PACKAGE_NAME,url,status,String(txt).slice(0,12000)]);
       await recordEvent(status,`Royal Caribbean login status: ${status}`,{url});
-      if(status==='interactive_verification_required') await sendPushover('⚠️ Royal login needs verification','Royal Caribbean requested a verification step. Open Royal Caribbean and complete sign-in once; the scanner can then reuse a captured session.');
+      if(status==='interactive_verification_required'||status==='captured_session_rejected') await sendPushover('⚠️ Royal session needs refresh','Royal Caribbean authentication needs a fresh browser session. Run the one-time capture script and update ROYAL_STORAGE_STATE_JSON in Railway.');
       result={ok:false,status,url};return result;
     }
 
+    console.log(`AUTH_SUCCESS ${JSON.stringify({via:auth.via||'unknown',session:sessionStateSummary()})}`);
     await page.goto(BOOKED_URL,{waitUntil:'networkidle',timeout:90000}).catch(()=>{});
     await page.waitForTimeout(5000);
     const url=page.url();
@@ -215,6 +233,7 @@ async function scanOnce() {
 }
 
 app.get('/health',async(_req,res)=>{try{await pool.query('select 1');res.json({ok:true,ship:CRUISE_SHIP,sailDate:SAIL_DATE,package:PACKAGE_NAME});}catch(e){res.status(500).json({ok:false,error:String(e.message||e)});}});
+app.get('/session-status',(_req,res)=>res.json({ok:true,session:sessionStateSummary()}));
 app.post('/test-push',async(_req,res)=>{try{await sendPushover('✅ Royal Caribbean Scanner','Pushover is connected. Your Oasis of the Seas Deluxe Beverage Package scanner is online.');res.json({ok:true});}catch(e){res.status(500).json({ok:false,error:String(e.message||e)});}});
 app.post('/scan-now',async(_req,res)=>res.json(await scanOnce()));
 app.get('/status',async(_req,res)=>{const{rows}=await pool.query(`select checked_at,price_per_person_per_day::float as price,promo_text,status,page_url from scans where ship=$1 and sail_date=$2 and package_name=$3 order by checked_at desc limit 20`,[CRUISE_SHIP,SAIL_DATE,PACKAGE_NAME]);res.json({ship:CRUISE_SHIP,sailDate:SAIL_DATE,endDate:END_DATE,guests:GUEST_COUNT,package:PACKAGE_NAME,history:rows});});
