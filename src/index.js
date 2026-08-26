@@ -25,6 +25,23 @@ const CRUISE_PLANNER_URL = process.env.CRUISE_PLANNER_URL || 'https://www.royalc
 if (!DATABASE_URL) throw new Error('DATABASE_URL is required');
 const pool = new Pool({ connectionString: DATABASE_URL, ssl: false });
 
+function logScan(result) {
+  const safe = {
+    ok: !!result?.ok,
+    status: result?.status || 'unknown',
+    price: result?.price ?? null,
+    previousLow: result?.previousLow ?? null,
+    isNewLow: result?.isNewLow ?? null,
+    promoText: result?.promoText ?? null,
+    url: result?.url ?? null,
+    error: result?.error ?? null,
+    ship: CRUISE_SHIP,
+    sailDate: SAIL_DATE,
+    package: PACKAGE_NAME,
+  };
+  console.log(`SCAN_RESULT ${JSON.stringify(safe)}`);
+}
+
 async function initDb() {
   await pool.query(`
     create table if not exists scans (
@@ -157,6 +174,7 @@ async function ensureLoggedIn(page) {
 async function scanOnce() {
   const previousLow = await getHistoricalLow();
   let browser;
+  let result;
   try {
     let storageState;
     if (ROYAL_STORAGE_STATE_JSON) storageState = JSON.parse(ROYAL_STORAGE_STATE_JSON);
@@ -175,7 +193,8 @@ async function scanOnce() {
       if (status === 'interactive_verification_required') {
         await sendPushover('⚠️ Royal login needs verification', 'Royal Caribbean requested a verification step. Open the app/site and complete sign-in once, then we can refresh the scanner session.');
       }
-      return { ok:false, status, url };
+      result = { ok:false, status, url };
+      return result;
     }
 
     await page.waitForTimeout(3000);
@@ -192,7 +211,8 @@ async function scanOnce() {
 
     if (price == null) {
       await recordEvent('parse_failed', 'Could not locate Deluxe Beverage Package price', { url });
-      return { ok:false, status, url };
+      result = { ok:false, status, url };
+      return result;
     }
 
     const totalBase = price * GUEST_COUNT * NIGHTS;
@@ -204,11 +224,16 @@ async function scanOnce() {
       await recordEvent(previousLow == null ? 'baseline' : 'new_low', msg, { price, previousLow });
     }
 
-    return { ok:true, status, price, previousLow, isNewLow, promoText, url };
+    result = { ok:true, status, price, previousLow, isNewLow, promoText, url };
+    return result;
   } catch (err) {
     await recordEvent('scan_error', String(err?.stack || err));
-    return { ok:false, status:'error', error:String(err?.message || err) };
-  } finally { if (browser) await browser.close().catch(() => {}); }
+    result = { ok:false, status:'error', error:String(err?.message || err) };
+    return result;
+  } finally {
+    if (browser) await browser.close().catch(() => {});
+    if (result) logScan(result);
+  }
 }
 
 app.get('/health', async (_req,res) => {
