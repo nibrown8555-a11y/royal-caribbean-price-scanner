@@ -4,9 +4,9 @@ import { chromium } from 'playwright';
 
 const { Pool } = pg;
 const app = express();
-app.use(express.json({ limit: '1mb' }));
+app.use(express.json());
 
-const PORT = process.env.PORT || 3000;
+const PORT = process.env.PORT || 8080;
 const DATABASE_URL = process.env.DATABASE_URL;
 const PUSHOVER_USER_KEY = process.env.PUSHOVER_USER_KEY;
 const PUSHOVER_APP_TOKEN = process.env.PUSHOVER_APP_TOKEN;
@@ -19,14 +19,14 @@ const END_DATE = process.env.END_DATE || '2027-01-15';
 const GUEST_COUNT = Number(process.env.GUEST_COUNT || 2);
 const NIGHTS = Number(process.env.CRUISE_NIGHTS || 4);
 const PACKAGE_NAME = process.env.PACKAGE_NAME || 'Deluxe Beverage Package';
-const ROYAL_STORAGE_STATE_JSON = process.env.ROYAL_STORAGE_STATE_JSON || '';
+const ROYAL_LOGIN_URL = 'https://www.royalcaribbean.com/myaccount/signin';
 const CRUISE_PLANNER_URL = process.env.CRUISE_PLANNER_URL || 'https://www.royalcaribbean.com/booked';
 
 if (!DATABASE_URL) throw new Error('DATABASE_URL is required');
 const pool = new Pool({ connectionString: DATABASE_URL, ssl: false });
 
 function logScan(result) {
-  const safe = {
+  console.log(`SCAN_RESULT ${JSON.stringify({
     ok: !!result?.ok,
     status: result?.status || 'unknown',
     price: result?.price ?? null,
@@ -37,9 +37,8 @@ function logScan(result) {
     error: result?.error ?? null,
     ship: CRUISE_SHIP,
     sailDate: SAIL_DATE,
-    package: PACKAGE_NAME,
-  };
-  console.log(`SCAN_RESULT ${JSON.stringify(safe)}`);
+    package: PACKAGE_NAME
+  })}`);
 }
 
 async function initDb() {
@@ -56,9 +55,7 @@ async function initDb() {
       status text not null,
       raw_text text
     );
-    create index if not exists scans_lookup_idx
-      on scans (ship, sail_date, package_name, checked_at desc);
-
+    create index if not exists scans_lookup_idx on scans(ship,sail_date,package_name,checked_at desc);
     create table if not exists scanner_events (
       id bigserial primary key,
       created_at timestamptz not null default now(),
@@ -73,7 +70,9 @@ async function sendPushover(title, message, priority = 0) {
   if (!PUSHOVER_USER_KEY || !PUSHOVER_APP_TOKEN) return false;
   const body = new URLSearchParams({ token: PUSHOVER_APP_TOKEN, user: PUSHOVER_USER_KEY, title, message, priority: String(priority) });
   const r = await fetch('https://api.pushover.net/1/messages.json', {
-    method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body,
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body
   });
   if (!r.ok) throw new Error(`Pushover failed: ${r.status} ${await r.text()}`);
   return true;
@@ -93,82 +92,106 @@ async function getHistoricalLow() {
 }
 
 function parsePriceFromText(text) {
-  const packageIdx = text.toLowerCase().indexOf(PACKAGE_NAME.toLowerCase());
-  const slice = packageIdx >= 0 ? text.slice(packageIdx, packageIdx + 3500) : text;
+  const idx = text.toLowerCase().indexOf(PACKAGE_NAME.toLowerCase());
+  const slice = idx >= 0 ? text.slice(idx, idx + 4000) : text;
   for (const p of [
     /\$\s*([0-9]{2,3}(?:\.[0-9]{2})?)\s*(?:USD)?\s*(?:\/|per)\s*(?:person\s*)?(?:\/|per)?\s*day/i,
-    /\$\s*([0-9]{2,3}(?:\.[0-9]{2})?)\s*(?:USD)?[^\n]{0,120}(?:per person per day|pppd)/i,
-    /from\s*\$\s*([0-9]{2,3}(?:\.[0-9]{2})?)/i,
+    /\$\s*([0-9]{2,3}(?:\.[0-9]{2})?)\s*(?:USD)?[^\n]{0,150}(?:per person per day|pppd)/i,
+    /from\s*\$\s*([0-9]{2,3}(?:\.[0-9]{2})?)/i
   ]) {
-    const m = slice.match(p); if (m) return Number(m[1]);
+    const m = slice.match(p);
+    if (m) return Number(m[1]);
   }
   return null;
 }
 
-async function fillFirst(page, selectors, value) {
+async function fillAny(page, selectors, value) {
   for (const selector of selectors) {
     const loc = page.locator(selector).first();
-    if (await loc.count()) {
-      try { if (await loc.isVisible({ timeout: 1000 })) { await loc.fill(value); return true; } } catch {}
-    }
+    try {
+      if (await loc.count() && await loc.isVisible({ timeout: 1200 })) {
+        await loc.fill(value);
+        return true;
+      }
+    } catch {}
   }
   return false;
 }
 
-async function clickFirst(page, selectors) {
+async function clickAny(page, selectors) {
   for (const selector of selectors) {
     const loc = page.locator(selector).first();
-    if (await loc.count()) {
-      try { if (await loc.isVisible({ timeout: 1000 })) { await loc.click(); return true; } } catch {}
-    }
+    try {
+      if (await loc.count() && await loc.isVisible({ timeout: 1200 })) {
+        await loc.click();
+        return true;
+      }
+    } catch {}
   }
   return false;
 }
 
 async function ensureLoggedIn(page) {
-  await page.goto(CRUISE_PLANNER_URL, { waitUntil: 'domcontentloaded', timeout: 90000 });
-  await page.waitForTimeout(5000);
-  let text = (await page.locator('body').innerText()).slice(0, 50000);
-  const lower = text.toLowerCase();
-  if (lower.includes(PACKAGE_NAME.toLowerCase()) || lower.includes('my cruises') || lower.includes('cruise planner')) return { ok: true };
-
   if (!ROYAL_EMAIL || !ROYAL_PASSWORD) return { ok: false, reason: 'credentials_missing' };
 
-  await clickFirst(page, [
-    'a:has-text("Sign in")','button:has-text("Sign in")','a:has-text("Log in")','button:has-text("Log in")'
-  ]).catch(() => {});
-  await page.waitForTimeout(1500);
+  await page.goto(ROYAL_LOGIN_URL, { waitUntil: 'domcontentloaded', timeout: 90000 });
+  await page.waitForTimeout(5000);
 
-  const emailOk = await fillFirst(page, [
-    'input[type="email"]','input[name*="email" i]','input[id*="email" i]','input[autocomplete="username"]'
+  let text = (await page.locator('body').innerText().catch(() => '')).slice(0, 50000);
+  let lower = text.toLowerCase();
+  if (lower.includes('manage reservation') || lower.includes('sign out') || lower.includes('my cruises')) return { ok: true };
+
+  const emailOk = await fillAny(page, [
+    'input[type="email"]',
+    'input[autocomplete="email"]',
+    'input[autocomplete="username"]',
+    'input[name*="email" i]',
+    'input[id*="email" i]',
+    'input[placeholder*="email" i]'
   ], ROYAL_EMAIL);
-  const passOk = await fillFirst(page, [
-    'input[type="password"]','input[name*="password" i]','input[id*="password" i]','input[autocomplete="current-password"]'
+
+  const passOk = await fillAny(page, [
+    'input[type="password"]',
+    'input[autocomplete="current-password"]',
+    'input[name*="password" i]',
+    'input[id*="password" i]',
+    'input[placeholder*="password" i]'
   ], ROYAL_PASSWORD);
 
   if (!emailOk || !passOk) {
-    text = (await page.locator('body').innerText()).slice(0, 50000);
+    const inputs = await page.locator('input').evaluateAll(els => els.map(e => ({type:e.type,name:e.name,id:e.id,placeholder:e.placeholder,autocomplete:e.autocomplete})).slice(0,20)).catch(() => []);
+    console.log(`LOGIN_INPUTS ${JSON.stringify(inputs)}`);
     return { ok: false, reason: 'login_fields_not_found', text };
   }
 
-  await clickFirst(page, [
-    'button[type="submit"]','button:has-text("Sign in")','button:has-text("Log in")'
+  await clickAny(page, [
+    'button[type="submit"]',
+    'button:has-text("Sign In")',
+    'button:has-text("Sign in")',
+    'button:has-text("Log In")',
+    'button:has-text("Continue")'
   ]);
   await page.waitForTimeout(8000);
 
-  text = (await page.locator('body').innerText()).slice(0, 50000);
-  const l2 = text.toLowerCase();
-  if (l2.includes('verification code') || l2.includes('one-time code') || l2.includes('captcha') || l2.includes('verify your identity')) {
+  text = (await page.locator('body').innerText().catch(() => '')).slice(0, 50000);
+  lower = text.toLowerCase();
+
+  if (lower.includes('verification code') || lower.includes('one-time code') || lower.includes('verify your identity') || lower.includes('captcha') || lower.includes('robot')) {
     return { ok: false, reason: 'interactive_verification_required', text };
   }
-  if (l2.includes('incorrect') || l2.includes('invalid password') || l2.includes('unable to sign in')) {
+  if (lower.includes('incorrect') || lower.includes('invalid password') || lower.includes('unable to sign in') || lower.includes('try again')) {
     return { ok: false, reason: 'login_rejected', text };
   }
 
-  await page.goto(CRUISE_PLANNER_URL, { waitUntil: 'domcontentloaded', timeout: 90000 }).catch(() => {});
-  await page.waitForTimeout(6000);
-  text = (await page.locator('body').innerText()).slice(0, 50000);
-  return { ok: !text.toLowerCase().includes('sign in'), reason: 'post_login_check', text };
+  await page.goto(CRUISE_PLANNER_URL, { waitUntil: 'domcontentloaded', timeout: 90000 });
+  await page.waitForTimeout(7000);
+  text = (await page.locator('body').innerText().catch(() => '')).slice(0, 50000);
+  lower = text.toLowerCase();
+
+  if (lower.includes('sign in') && !lower.includes('manage reservation')) {
+    return { ok: false, reason: 'post_login_check_failed', text };
+  }
+  return { ok: true };
 }
 
 async function scanOnce() {
@@ -176,10 +199,8 @@ async function scanOnce() {
   let browser;
   let result;
   try {
-    let storageState;
-    if (ROYAL_STORAGE_STATE_JSON) storageState = JSON.parse(ROYAL_STORAGE_STATE_JSON);
     browser = await chromium.launch({ headless: true });
-    const context = await browser.newContext({ storageState });
+    const context = await browser.newContext();
     const page = await context.newPage();
 
     const auth = await ensureLoggedIn(page);
@@ -191,13 +212,12 @@ async function scanOnce() {
         [CRUISE_SHIP, SAIL_DATE, PACKAGE_NAME, url, status, String(text).slice(0,12000)]);
       await recordEvent(status, `Royal Caribbean login status: ${status}`, { url });
       if (status === 'interactive_verification_required') {
-        await sendPushover('⚠️ Royal login needs verification', 'Royal Caribbean requested a verification step. Open the app/site and complete sign-in once, then we can refresh the scanner session.');
+        await sendPushover('⚠️ Royal login needs verification', 'Royal Caribbean requested a verification step. Open Royal Caribbean and complete sign-in, then we can refresh the scanner session.');
       }
       result = { ok:false, status, url };
       return result;
     }
 
-    await page.waitForTimeout(3000);
     const url = page.url();
     const text = (await page.locator('body').innerText()).slice(0,50000);
     const price = parsePriceFromText(text);
