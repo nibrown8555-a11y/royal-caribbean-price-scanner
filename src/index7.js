@@ -43,6 +43,6 @@ app.get('/full-test',async(_q,res)=>res.json(await scanOnce({forceNotify:true}))
 app.get('/status',async(_q,res)=>{const{rows}=await pool.query(`select checked_at,package_name,price_per_person_per_day::float price,promo_text,status from scans where ship=$1 and sail_date=$2 and package_name=$3 order by checked_at desc limit 50`,[CRUISE_SHIP,SAIL_DATE,PACKAGE_NAME]);res.json({ship:CRUISE_SHIP,sailDate:SAIL_DATE,tracked:PACKAGE_NAME,history:rows});});
 await initDb();
 app.listen(PORT,()=>console.log(`scanner listening on ${PORT}`));
-if(PUSHOVER_TEST_ON_START)setTimeout(()=>sendPushover('Royal Caribbean scanner test','Bundle monitoring is online. Current price will be sent on a new historical low.').catch(e=>console.log('PUSHOVER_TEST_FAILED '+String(e.message||e))),5000);
+if(PUSHOVER_TEST_ON_START)setTimeout(()=>scanOnce({forceNotify:true}).catch(e=>console.log('FULL_TEST_FAILED '+String(e.message||e))),5000);
 setTimeout(()=>scanOnce().catch(console.error),15000);
 setInterval(()=>scanOnce().catch(console.error),SCAN_INTERVAL_MINUTES*60*1000);
