@@ -4,7 +4,7 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "start":"node src/index7.js",
+    "start":"node src/index8.js",
     "capture-session":"node scripts/capture-session.mjs"
   },
   "dependencies": {
