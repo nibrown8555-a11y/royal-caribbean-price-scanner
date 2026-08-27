@@ -1,0 +1,46 @@
+import express from 'express';
+import pg from 'pg';
+import zlib from 'zlib';
+import { chromium } from 'playwright';
+const { Pool } = pg;
+const app=express();
+const PORT=process.env.PORT||8080;
+const DATABASE_URL=process.env.DATABASE_URL;
+const PUSHOVER_USER_KEY=process.env.PUSHOVER_USER_KEY||'';
+const PUSHOVER_APP_TOKEN=process.env.PUSHOVER_APP_TOKEN||'';
+const ROYAL_CATALOG_URL=process.env.ROYAL_CATALOG_URL||'';
+const ROYAL_ACCESS_TOKEN=process.env.ROYAL_ACCESS_TOKEN||'';
+const ROYAL_APPKEY=process.env.ROYAL_APPKEY||'';
+const ROYAL_ACCOUNT_ID=process.env.ROYAL_ACCOUNT_ID||'';
+const ROYAL_CHANNEL=process.env.ROYAL_CHANNEL||'';
+const ROYAL_REQ_APP_ID=process.env.ROYAL_REQ_APP_ID||'';
+const ROYAL_REQ_APP_VERS=process.env.ROYAL_REQ_APP_VERS||'';
+const ROYAL_VDS_ID=process.env.ROYAL_VDS_ID||'';
+const SCAN_INTERVAL_MINUTES=Number(process.env.SCAN_INTERVAL_MINUTES||10);
+const CRUISE_SHIP=process.env.CRUISE_SHIP||'Oasis of the Seas';
+const SAIL_DATE=process.env.SAIL_DATE||'2027-01-11';
+const GUEST_COUNT=Number(process.env.GUEST_COUNT||2);
+const NIGHTS=Number(process.env.CRUISE_NIGHTS||4);
+const TRACKED=[
+ {key:'deluxe',packageName:'Deluxe Beverage Package',alertLabel:'Deluxe Beverage Package',match:p=>/deluxe beverage package/i.test(p.title||'')&&!/royal beach club|open bar day pass|\+/.test((p.title||'').toLowerCase())},
+ {key:'bundle',packageName:'Deluxe Beverage Package + Royal Beach Club Open Bar Day Pass',alertLabel:'Deluxe + Royal Beach Club bundle',match:p=>/deluxe beverage package/i.test(p.title||'')&&/royal beach club|open bar day pass|\+/.test((p.title||'').toLowerCase())}
+];
+if(!DATABASE_URL)throw new Error('DATABASE_URL is required');
+if(!ROYAL_CATALOG_URL)throw new Error('ROYAL_CATALOG_URL is required');
+const pool=new Pool({connectionString:DATABASE_URL,ssl:false});
+function encodedSession(){if(process.env.ROYAL_STORAGE_STATE_GZIP_B64)return process.env.ROYAL_STORAGE_STATE_GZIP_B64;return Object.entries(process.env).filter(([k,v])=>/^ROYAL_STORAGE_STATE_PART_\d+$/.test(k)&&v).sort(([a],[b])=>a.localeCompare(b,undefined,{numeric:true})).map(([,v])=>v).join('');}
+function storageState(){const e=encodedSession();if(!e)return null;return JSON.parse(zlib.gunzipSync(Buffer.from(e,'base64')).toString('utf8'));}
+function sessionSummary(){try{const s=storageState();return{configured:!!s,cookieCount:s?.cookies?.length||0,originCount:s?.origins?.length||0,valid:true,partCount:Object.keys(process.env).filter(k=>/^ROYAL_STORAGE_STATE_PART_\d+$/.test(k)).length,accessTokenConfigured:!!ROYAL_ACCESS_TOKEN,appkeyConfigured:!!ROYAL_APPKEY,accountIdConfigured:!!ROYAL_ACCOUNT_ID,channelConfigured:!!ROYAL_CHANNEL,reqAppIdConfigured:!!ROYAL_REQ_APP_ID,reqAppVersConfigured:!!ROYAL_REQ_APP_VERS,vdsIdConfigured:!!ROYAL_VDS_ID};}catch{return{configured:true,valid:false};}}
+async function initDb(){await pool.query(`create table if not exists scans(id bigserial primary key,checked_at timestamptz not null default now(),ship text not null,sail_date date not null,package_name text not null,price_per_person_per_day numeric(10,2),promo_text text,page_url text,status text not null,raw_text text);create index if not exists scans_lookup_idx on scans(ship,sail_date,package_name,checked_at desc);`);}
+async function getLow(packageName){const{rows}=await pool.query('select min(price_per_person_per_day)::float low from scans where ship=$1 and sail_date=$2 and package_name=$3 and price_per_person_per_day is not null',[CRUISE_SHIP,SAIL_DATE,packageName]);return rows[0]?.low??null;}
+async function sendPushover(title,message,priority=0){if(!PUSHOVER_USER_KEY||!PUSHOVER_APP_TOKEN)return false;const body=new URLSearchParams({token:PUSHOVER_APP_TOKEN,user:PUSHOVER_USER_KEY,title,message,priority:String(priority)});const r=await fetch('https://api.pushover.net/1/messages.json',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body});if(!r.ok)throw new Error(`Pushover failed: ${r.status}`);return true;}
+function walkProducts(root){const out=[],seen=new Set();function walk(x){if(!x||typeof x!=='object')return;if(typeof x.title==='string'&&(x.lowestAdultPrice!=null||x.msrpAdultPrice!=null||x.productTypeCategory)){const key=`${x.id||''}|${x.title}`;if(!seen.has(key)){seen.add(key);out.push(x);}}if(Array.isArray(x)){for(const v of x)walk(v);}else{for(const v of Object.values(x))walk(v);}}walk(root);return out;}
+function promoText(p){return p?.promoDescription?.displayName||p?.promoDescription?.title||null;}
+function snap(p){return{id:p?.id??null,title:p?.title??null,lowestAdultPrice:p?.lowestAdultPrice??null,msrpAdultPrice:p?.msrpAdultPrice??null,promoDescription:p?.promoDescription??null,salesUnit:p?.salesUnit??null,unit:p?.unit??null};}
+async function handle(def,product){const previousLow=await getLow(def.packageName);if(!product){await pool.query(`insert into scans(ship,sail_date,package_name,page_url,status,raw_text) values($1,$2,$3,$4,$5,$6)`,[CRUISE_SHIP,SAIL_DATE,def.packageName,ROYAL_CATALOG_URL,'product_not_found','{}']);return{key:def.key,ok:false,status:'product_not_found'};}const price=Number(product.lowestAdultPrice);if(!Number.isFinite(price))return{key:def.key,ok:false,status:'price_missing',productTitle:product.title};const promo=promoText(product);await pool.query(`insert into scans(ship,sail_date,package_name,price_per_person_per_day,promo_text,page_url,status,raw_text) values($1,$2,$3,$4,$5,$6,$7,$8)`,[CRUISE_SHIP,SAIL_DATE,def.packageName,price,promo,ROYAL_CATALOG_URL,'ok',JSON.stringify(snap(product)).slice(0,12000)]);const isNewLow=previousLow==null||price<previousLow;if(isNewLow){const total=price*GUEST_COUNT*NIGHTS;const title=previousLow==null?'🍹 Cruise package baseline':'🚨 Royal Caribbean price drop';const msg=`${def.alertLabel}: $${price.toFixed(2)}/person/day for ${CRUISE_SHIP}. ${GUEST_COUNT} guests × ${NIGHTS} nights = $${total.toFixed(2)} before gratuities/taxes.${promo?` ${promo}.`:''}${previousLow==null?'':` Previous low: $${Number(previousLow).toFixed(2)}.`}`;await sendPushover(title,msg,previousLow==null?0:1);}return{key:def.key,ok:true,status:'ok',price,previousLow,isNewLow,promoText:promo,productTitle:product.title,msrpAdultPrice:product.msrpAdultPrice??null};}
+async function scanOnce(){let browser,result;try{const state=storageState();if(!state){result={ok:false,status:'session_required'};return result;}console.log('SESSION_STATE '+JSON.stringify(sessionSummary()));browser=await chromium.launch({headless:true,args:['--no-sandbox','--disable-dev-shm-usage']});const headers={Accept:'application/json, text/plain, */*','Accept-Language':'en-US,en;q=0.9',Origin:'https://www.royalcaribbean.com',Referer:'https://www.royalcaribbean.com/'};if(ROYAL_ACCESS_TOKEN)headers['Access-Token']=ROYAL_ACCESS_TOKEN;if(ROYAL_APPKEY)headers['Appkey']=ROYAL_APPKEY;if(ROYAL_ACCOUNT_ID)headers['Account-Id']=ROYAL_ACCOUNT_ID;if(ROYAL_CHANNEL)headers['Channel']=ROYAL_CHANNEL;if(ROYAL_REQ_APP_ID)headers['Req-App-Id']=ROYAL_REQ_APP_ID;if(ROYAL_REQ_APP_VERS)headers['Req-App-Vers']=ROYAL_REQ_APP_VERS;if(ROYAL_VDS_ID)headers['Vds-Id']=ROYAL_VDS_ID;const context=await browser.newContext({storageState:state,locale:'en-US',timezoneId:'America/Chicago',extraHTTPHeaders:headers});const r=await context.request.get(ROYAL_CATALOG_URL,{timeout:90000});const status=r.status(),ct=r.headers()['content-type']||'',body=await r.text();console.log('CATALOG_HTTP '+JSON.stringify({status,contentType:ct,length:body.length}));if(status!==200){result={ok:false,status:'catalog_http_error',httpStatus:status};return result;}let json;try{json=JSON.parse(body);}catch{result={ok:false,status:'catalog_invalid_json'};return result;}const products=walkProducts(json);const deluxeCandidates=products.filter(p=>/deluxe beverage package/i.test(p.title||'')).map(snap);console.log('DELUXE_CANDIDATES '+JSON.stringify(deluxeCandidates));const results=[];for(const def of TRACKED)results.push(await handle(def,products.find(def.match)||null));result={ok:results.some(x=>x.ok),status:results.every(x=>x.ok)?'ok':'partial',products:results};return result;}catch(e){result={ok:false,status:'error',error:String(e.message||e)};return result;}finally{if(browser)await browser.close().catch(()=>{});if(result)console.log('SCAN_RESULT '+JSON.stringify({...result,ship:CRUISE_SHIP,sailDate:SAIL_DATE}));}}
+app.get('/health',async(_q,res)=>{try{await pool.query('select 1');res.json({ok:true});}catch(e){res.status(500).json({ok:false,error:String(e.message||e)});}});
+app.get('/session-status',(_q,res)=>res.json({ok:true,session:sessionSummary()}));
+app.post('/scan-now',async(_q,res)=>res.json(await scanOnce()));
+app.get('/status',async(_q,res)=>{const{rows}=await pool.query(`select checked_at,package_name,price_per_person_per_day::float price,promo_text,status from scans where ship=$1 and sail_date=$2 and package_name = any($3::text[]) order by checked_at desc limit 50`,[CRUISE_SHIP,SAIL_DATE,TRACKED.map(x=>x.packageName)]);res.json({ship:CRUISE_SHIP,sailDate:SAIL_DATE,tracked:TRACKED.map(x=>x.packageName),history:rows});});
+await initDb();app.listen(PORT,()=>console.log(`scanner listening on ${PORT}`));setTimeout(()=>scanOnce().catch(console.error),15000);setInterval(()=>scanOnce().catch(console.error),SCAN_INTERVAL_MINUTES*60*1000);
