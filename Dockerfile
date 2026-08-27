@@ -4,4 +4,4 @@ COPY package*.json ./
 RUN npm install --omit=dev
 COPY . .
 ENV NODE_ENV=production
-CMD ["npm","start"]
+CMD ["node","src/index7.js"]
