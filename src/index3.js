@@ -20,7 +20,7 @@ const END_DATE = process.env.END_DATE || '2027-01-15';
 const GUEST_COUNT = Number(process.env.GUEST_COUNT || 2);
 const NIGHTS = Number(process.env.CRUISE_NIGHTS || 4);
 const PACKAGE_NAME = process.env.PACKAGE_NAME || 'Deluxe Beverage Package';
-const BOOKED_URL = process.env.CRUISE_PLANNER_URL || 'https://www.royalcaribbean.com/booked';
+const BOOKED_URL = process.env.RESERVATION_DASHBOARD_URL || 'https://www.royalcaribbean.com/reservation/dashboard';
 
 if (!DATABASE_URL) throw new Error('DATABASE_URL is required');
 const pool = new Pool({ connectionString:DATABASE_URL, ssl:false });
@@ -68,44 +68,32 @@ async function scanOnce(){
       try{
         const ct=(resp.headers()['content-type']||'').toLowerCase();if(!ct.includes('json'))return;
         const url=resp.url();let body='';try{body=(await resp.text()).slice(0,50000);}catch{}
-        if(jsonBodies.length<80)jsonBodies.push({url,body});
+        if(jsonBodies.length<120)jsonBodies.push({url,body});
         if(!bookingId){const found=findBookingId(url)||findBookingId(body);if(found){bookingId=found;console.log('BOOKING_ID_FOUND '+JSON.stringify({source:'network',found:true,length:found.length}));}}
       }catch{}
     });
 
-    await page.goto(BOOKED_URL,{waitUntil:'domcontentloaded',timeout:90000});await page.waitForTimeout(9000);
+    await page.goto(BOOKED_URL,{waitUntil:'domcontentloaded',timeout:90000});await page.waitForTimeout(12000);
     const bookedText=(await page.locator('body').innerText().catch(()=>'' )).slice(0,120000);const bookedLower=bookedText.toLowerCase();
-    if(bookedLower.includes('sign in')&&!bookedLower.includes('manage reservation')&&!bookedLower.includes('cruise planner')){result={ok:false,status:'session_expired',price:null,url:page.url()};return result;}
+    console.log('RESERVATION_DASHBOARD '+JSON.stringify({url:page.url(),title:await page.title().catch(()=>''),hasManage:bookedLower.includes('manage reservation'),hasOasis:bookedLower.includes('oasis'),textSnippet:bookedText.slice(0,2500)}));
+    if(bookedLower.includes('sign in')&&!bookedLower.includes('manage reservation')&&!bookedLower.includes('upcoming cruises')){result={ok:false,status:'session_expired',price:null,url:page.url()};return result;}
 
     if(!bookingId){
-      try{
-        const browserStorage=await page.evaluate(()=>({local:Object.entries(localStorage),session:Object.entries(sessionStorage),url:location.href}));
-        bookingId=findBookingId(JSON.stringify(browserStorage));
-        if(bookingId)console.log('BOOKING_ID_FOUND '+JSON.stringify({source:'browser_storage',found:true,length:bookingId.length}));
-      }catch{}
+      try{const browserStorage=await page.evaluate(()=>({local:Object.entries(localStorage),session:Object.entries(sessionStorage),url:location.href}));bookingId=findBookingId(JSON.stringify(browserStorage));if(bookingId)console.log('BOOKING_ID_FOUND '+JSON.stringify({source:'browser_storage',found:true,length:bookingId.length}));}catch{}
     }
-    if(!bookingId){
-      const hrefs=await page.locator('a').evaluateAll(as=>as.map(a=>a.href).filter(Boolean)).catch(()=>[]);
-      bookingId=findBookingId(JSON.stringify(hrefs));
-      if(bookingId)console.log('BOOKING_ID_FOUND '+JSON.stringify({source:'page_links',found:true,length:bookingId.length}));
-    }
+    if(!bookingId){const hrefs=await page.locator('a').evaluateAll(as=>as.map(a=>a.href).filter(Boolean)).catch(()=>[]);bookingId=findBookingId(JSON.stringify(hrefs));if(bookingId)console.log('BOOKING_ID_FOUND '+JSON.stringify({source:'page_links',found:true,length:bookingId.length}));}
     console.log('BOOKING_DISCOVERY '+JSON.stringify({found:!!bookingId,jsonResponseCount:jsonBodies.length}));
-    if(!bookingId){
-      const apiUrls=jsonBodies.map(x=>x.url).filter(u=>/booking|reservation|cruise|planner|guest/i.test(u)).slice(0,40);
-      console.log('BOOKING_API_URLS '+JSON.stringify(apiUrls));
-      result={ok:false,status:'booking_id_not_found',price:null,url:page.url()};return result;
-    }
+    if(!bookingId){const apiUrls=jsonBodies.map(x=>x.url).filter(u=>/booking|reservation|cruise|planner|guest|voyage/i.test(u)).slice(0,60);console.log('BOOKING_API_URLS '+JSON.stringify(apiUrls));result={ok:false,status:'booking_id_not_found',price:null,url:page.url()};return result;}
 
     const target=`https://www.royalcaribbean.com/account/cruise-planner/category/beverage?bookingId=${encodeURIComponent(bookingId)}&shipCode=${encodeURIComponent(SHIP_CODE)}&sailDate=${SAIL_DATE_COMPACT}`;
     console.log('BEVERAGE_TARGET '+JSON.stringify({bookingIdPresent:true,shipCode:SHIP_CODE,sailDate:SAIL_DATE_COMPACT}));
     await page.goto(target,{waitUntil:'domcontentloaded',timeout:90000});await page.waitForTimeout(15000);
     const url=page.url();const text=(await page.locator('body').innerText().catch(()=>'' )).slice(0,150000);const lower=text.toLowerCase();
-    const relevant=jsonBodies.filter(x=>/beverage|package|product|planner|catalog|offer|price/i.test(x.url)||/deluxe beverage|deluxe.*package/i.test(x.body)).slice(-40);
+    const relevant=jsonBodies.filter(x=>/beverage|package|product|planner|catalog|offer|price/i.test(x.url)||/deluxe beverage|deluxe.*package/i.test(x.body)).slice(-50);
     console.log('BEVERAGE_PAGE '+JSON.stringify({url,title:await page.title().catch(()=>''),hasDeluxe:lower.includes('deluxe beverage'),isError:/on vacation|don.t let that stop/i.test(lower),textSnippet:text.slice(0,3500)}));
     console.log('BEVERAGE_API_URLS '+JSON.stringify(relevant.map(x=>({url:x.url,mentionsDeluxe:/deluxe beverage|deluxe.*package/i.test(x.body)}))));
 
-    let price=parsePrice(text);
-    if(price==null){for(const x of relevant){if(/deluxe beverage|deluxe.*package/i.test(x.body)){price=parsePrice(x.body);if(price!=null)break;}}}
+    let price=parsePrice(text);if(price==null){for(const x of relevant){if(/deluxe beverage|deluxe.*package/i.test(x.body)){price=parsePrice(x.body);if(price!=null)break;}}}
     const promoText=text.match(/(?:up to\s+)?\d{1,2}%\s*off[^\n]*/i)?.[0]||null;
     const status=price==null?'parse_failed':'ok';
     await pool.query(`insert into scans(ship,sail_date,package_name,price_per_person_per_day,promo_text,page_url,status,raw_text) values($1,$2,$3,$4,$5,$6,$7,$8)`,[CRUISE_SHIP,SAIL_DATE,PACKAGE_NAME,price,promoText,url,status,text.slice(0,12000)]);
